@@ -13,12 +13,14 @@ import aiohttp
 import cv2
 import numpy as np
 import pyfakewebcam
-import requests
-import requests_unixsocket
 import os
 import fnmatch
 import time
 import threading
+
+import tensorflow as tf
+from tf_bodypix.api import download_model, load_model, BodyPixModelPaths
+
 
 from akvcam import AkvCameraWriter
 
@@ -125,15 +127,12 @@ class FakeCam:
         width: int,
         height: int,
         codec: str,
-        scale_factor: float,
         no_background: bool,
         background_blur: int,
         background_keep_aspect: bool,
         use_foreground: bool,
         hologram: bool,
         tiling: bool,
-        bodypix_url: str,
-        socket: str,
         background_image: str,
         foreground_image: str,
         foreground_mask_image: str,
@@ -150,7 +149,6 @@ class FakeCam:
         self.background_image = background_image
         self.foreground_image = foreground_image
         self.foreground_mask_image = foreground_mask_image
-        self.scale_factor = scale_factor
         self.real_cam = RealCam(webcam_path, width, height, fps, codec)
         # In case the real webcam does not support the requested mode.
         self.width = self.real_cam.get_frame_width()
@@ -162,38 +160,21 @@ class FakeCam:
             self.fake_cam = AkvCameraWriter(v4l2loopback_path, self.width, self.height)
         self.foreground_mask = None
         self.inverted_foreground_mask = None
-        self.session = requests.Session()
-        if bodypix_url.startswith('/'):
-            print("Looks like you want to use a unix socket")
-            # self.session = requests_unixsocket.Session()
-            self.bodypix_url = "http+unix:/" + bodypix_url
-            self.socket = bodypix_url
-            requests_unixsocket.monkeypatch()
-        else:
-            self.bodypix_url = bodypix_url
-            self.socket = ""
-            # self.session = requests.Session()
         self.images: Dict[str, Any] = {}
         self.image_lock = asyncio.Lock()
+        self.bodypix_model = load_model(download_model(
+            BodyPixModelPaths.MOBILENET_FLOAT_50_STRIDE_16
+        ))
 
-    async def _get_mask(self, frame, session):
-        frame = cv2.resize(frame, (0, 0), fx=self.scale_factor,
-                           fy=self.scale_factor)
-        _, data = cv2.imencode(".png", frame)
-        #print("Posting to " + self.bodypix_url)
-        async with session.post(
-            url=self.bodypix_url, data=data.tobytes(),
-            headers={"Content-Type": "application/octet-stream"}
-        ) as r:
-            mask = np.frombuffer(await r.read(), dtype=np.uint8)
-            mask = mask.reshape((frame.shape[0], frame.shape[1]))
-            mask = cv2.resize(
-                mask, (0, 0), fx=1 / self.scale_factor,
-                fy=1 / self.scale_factor, interpolation=cv2.INTER_NEAREST
-            )
-            mask = cv2.dilate(mask, np.ones((10, 10), np.uint8), iterations=1)
-            mask = cv2.blur(mask.astype(float), (30, 30))
-            return mask
+
+    def _get_mask(self, frame):
+        res = self.bodypix_model.predict_single(frame)
+        mask = res.get_mask(threshold=0.60)
+        mask = np.frombuffer(mask, dtype=np.uint32)
+        mask = mask.reshape((frame.shape[0], frame.shape[1]))
+        mask = cv2.dilate(mask.astype(float), np.ones((10, 10), np.uint8), iterations=1)
+        mask = cv2.blur(mask.astype(float), (30, 30))
+        return mask
 
     def shift_image(self, img, dx, dy):
         img = np.roll(img, dy, axis=0)
@@ -302,13 +283,13 @@ then scale & crop the image so that its pixels retain their aspect ratio."""
         return out
 
 
-    async def mask_frame(self, session, frame):
+    async def mask_frame(self, frame):
         # fetch the mask with retries (the app needs to warmup and we're lazy)
         # e v e n t u a l l y c o n s i s t e n t
         mask = None
         while mask is None:
             try:
-                mask = await self._get_mask(frame, session)
+                mask = self._get_mask(frame)
             except Exception as e:
                 print(f"Mask request failed, retrying: {e}")
                 traceback.print_exc()
@@ -346,28 +327,24 @@ then scale & crop the image so that its pixels retain their aspect ratio."""
     async def run(self):
         await self.load_images()
         self.real_cam.start()
-        if self.socket != "":
-            conn = aiohttp.UnixConnector(path=self.socket)
-        else:
-            conn = None
-        async with aiohttp.ClientSession(connector=conn) as session:
-            t0 = time.monotonic()
-            print_fps_period = 1
-            frame_count = 0
-            while True:
-                frame = self.real_cam.read()
-                if frame is None:
-                    await asyncio.sleep(0.1)
-                    continue
-                frame = await self.mask_frame(session, frame)
-                self.put_frame(frame)
-                frame_count += 1
-                td = time.monotonic() - t0
-                if td > print_fps_period:
-                    self.current_fps = frame_count / td
-                    print("FPS: {:6.2f}".format(self.current_fps), end="\r")
-                    frame_count = 0
-                    t0 = time.monotonic()
+
+        t0 = time.monotonic()
+        print_fps_period = 1
+        frame_count = 0
+        while True:
+            frame = self.real_cam.read()
+            if frame is None:
+                await asyncio.sleep(0.1)
+                continue
+            frame = await self.mask_frame(frame)
+            self.put_frame(frame)
+            frame_count += 1
+            td = time.monotonic() - t0
+            if td > print_fps_period:
+                self.current_fps = frame_count / td
+                print("FPS: {:6.2f}".format(self.current_fps), end="\r")
+                frame_count = 0
+                t0 = time.monotonic()
 
 def parse_args():
     parser = ArgumentParser(description="Faking your webcam background under \
@@ -382,10 +359,6 @@ def parse_args():
                         help="Set real webcam FPS")
     parser.add_argument("-C", "--codec", default='MJPG', type=str,
                         help="Set real webcam codec")
-    parser.add_argument("-S", "--scale-factor", default=0.5, type=float,
-                        help="Scale factor of the image sent to BodyPix network")
-    parser.add_argument("-B", "--bodypix-url", default="http://127.0.0.1:9000",
-                        help="Tensorflow BodyPix URL")
     parser.add_argument("-w", "--webcam-path", default="/dev/video0",
                         help="Set real webcam path")
     parser.add_argument("-v", "--v4l2loopback-path", default="/dev/video2",
@@ -439,15 +412,12 @@ def main():
         width=args.width,
         height=args.height,
         codec=args.codec,
-        scale_factor=args.scale_factor,
         no_background=args.no_background,
         background_blur=getNextOddNumber(args.background_blur),
         background_keep_aspect=args.background_keep_aspect,
         use_foreground=not args.no_foreground,
         hologram=args.hologram,
         tiling=args.tile_background,
-        bodypix_url=args.bodypix_url,
-        socket="",
         background_image=findFile(args.background_image, args.image_folder),
         foreground_image=findFile(args.foreground_image, args.image_folder),
         foreground_mask_image=findFile(args.foreground_mask_image, args.image_folder),
